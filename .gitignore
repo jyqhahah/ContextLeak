@@ -117,16 +117,12 @@ ENV/
 # ckpt
 *.lock
 
-# data
-*.parquet
-
 
 # local logs
 logs
 log
 outputs
 .history
-data/
 .
 # ckpts
 ckpts/
