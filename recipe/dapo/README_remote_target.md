@@ -23,23 +23,39 @@ path runs unchanged.
 - `serve_target.sh` — launches the target vLLM server.
 - `run_userprompt_remote.sh` — training launcher (ingroup + remote target).
 
-## Requirements
-- **Training/client side** (the verl env that runs the trainer): only extra dep is
-  `requests` (added to the base `requirements.txt`).
-- **Target serving side**: the target model (Qwen3.5 / gpt-oss / Gemma …) needs a
-  **recent** transformers + vLLM that the training env's older vLLM cannot load, so
-  use a **separate serving env** and point `VLLM_BIN` at its `vllm`. Verified combo
-  (Python 3.10, CUDA 12.8): `torch==2.10.0`, `vllm==0.19.1`, `transformers==5.5.4`,
-  `tokenizers==0.22.2`, `numpy==2.2.6`.
-  - Pinned list: `recipe/dapo/requirements-target-serving.txt`
-  - Exact lock (188 pkgs): `recipe/dapo/target-serving-env-freeze.txt`
-  ```bash
-  conda create -n target-serving python=3.10 -y && conda activate target-serving
-  pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
-  pip install vllm==0.19.1 transformers==5.5.4 tokenizers==0.22.2 numpy==2.2.6 json-repair
-  # then:  VLLM_BIN=$(which vllm) bash recipe/dapo/serve_target.sh 1 8100
-  ```
-  Weights are pulled from HF (needs network or a local cache).
+## Requirements — TWO SEPARATE conda envs
+
+The trainer and the target server run in **different** envs (different CUDA / torch /
+vLLM / transformers). You need both.
+
+### (A) Training env — runs the DAPO trainer + actor Qwen3-8B
+This is the normal ContextLeak/verl env. Verified combo (Python 3.10, **CUDA 12.4**):
+`torch==2.6.0+cu124`, `vllm==0.8.5.post1`, `transformers==4.51.1`, `ray==2.51.1`,
+`flash_attn==2.7.4.post1`, `tokenizers==0.21.4`. Only extra dep for the remote-target
+client is `requests` (already in base `requirements.txt`).
+- Exact lock (274 pkgs): `recipe/dapo/requirements-training-env-freeze.txt`
+```bash
+conda create -n verl python=3.10 -y && conda activate verl
+pip install -e .                      # ContextLeak (installs verl + deps)
+pip install requests                  # remote-target client
+# for exact repro instead: pip install -r recipe/dapo/requirements-training-env-freeze.txt
+```
+
+### (B) Target serving env — runs `vllm serve <target-model>` (Qwen3.5-9B)
+The target model needs a **recent** transformers + vLLM that the training env's older
+vLLM **cannot** load — so this MUST be a separate env; point `VLLM_BIN` at its `vllm`.
+Verified combo (Python 3.10, **CUDA 12.8**): `torch==2.10.0+cu128`, `vllm==0.19.1`,
+`transformers==5.5.4`, `tokenizers==0.22.2`, `numpy==2.2.6`.
+- Pinned list: `recipe/dapo/requirements-target-serving.txt`
+- Exact lock (188 pkgs): `recipe/dapo/target-serving-env-freeze.txt`
+```bash
+conda create -n target-serving python=3.10 -y && conda activate target-serving
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+pip install vllm==0.19.1 transformers==5.5.4 tokenizers==0.22.2 numpy==2.2.6 json-repair
+# then:  VLLM_BIN=$(which vllm) bash recipe/dapo/serve_target.sh 1 8100
+```
+
+Target weights are pulled from HF (needs network or a local cache).
 
 ## How to run (two GPUs: one target, one training)
 ```bash
