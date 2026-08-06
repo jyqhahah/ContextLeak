@@ -27,6 +27,7 @@ from verl.utils.device import is_cuda_available
 
 from .dapo_ray_trainer import RayDAPOTrainer
 from .dapo_ray_trainer_random_strat import RayDAPOTrainerRandomStrat
+from .dapo_ray_trainer_strat_ingroup import RayDAPOTrainerStratIngroup
 
 
 @hydra.main(config_path="config", config_name="dapo_trainer", version_base=None)
@@ -180,6 +181,17 @@ class TaskRunner:
             )
         elif trainer_type == "random":
             trainer = RayDAPOTrainerRandomStrat(
+                config=config,
+                tokenizer=tokenizer,
+                processor=processor,
+                role_worker_mapping=role_worker_mapping,
+                resource_pool_manager=resource_pool_manager,
+                ray_worker_group_cls=ray_worker_group_cls,
+                reward_fn=reward_fn,
+                val_reward_fn=val_reward_fn,
+            )
+        elif trainer_type == "ingroup":
+            trainer = RayDAPOTrainerStratIngroup(
                 config=config,
                 tokenizer=tokenizer,
                 processor=processor,
