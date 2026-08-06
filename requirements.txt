@@ -24,3 +24,5 @@ fastapi
 latex2sympy2_extended
 math_verify
 tensorboard
+# remote-target reward client (recipe/dapo/remote_target_client.py)
+requests>=2.31

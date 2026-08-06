@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Requirements for the DECOUPLED TARGET-AGENT serving env (serve_target.sh).
+#
+# This is a SEPARATE env from the training (verl) env: it just runs
+# `vllm serve <target-model>`. The target models we use (Qwen3.5-9B, gpt-oss,
+# Gemma-4) need a RECENT transformers + vLLM that the training env's older vLLM
+# cannot load. Create this env only for serving and point serve_target.sh at it
+# via VLLM_BIN=/path/to/this-env/bin/vllm.
+#
+# Verified working combo (Python 3.10, CUDA 12.8):
+# ─────────────────────────────────────────────────────────────────────────────
+torch==2.10.0            # +cu128 build; match your CUDA (installed via the cu128 index)
+vllm==0.19.1
+transformers==5.5.4
+tokenizers==0.22.2
+numpy==2.2.6
+json-repair
+
+# Install (example, CUDA 12.8):
+#   conda create -n target-serving python=3.10 -y && conda activate target-serving
+#   pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+#   pip install vllm==0.19.1 transformers==5.5.4 tokenizers==0.22.2 numpy==2.2.6 json-repair
+#
+# For an EXACT reproduction, use the full lock file in this dir:
+#   pip install -r target-serving-env-freeze.txt
+#
+# ── Training/client side (the verl env that runs the trainer) ──
+# The only extra dependency for the remote-target client is `requests`
+# (usually already present). If not:  pip install requests>=2.31
