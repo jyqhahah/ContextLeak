@@ -10,17 +10,26 @@ system prompt. This is what makes the trained attack transfer to real agents.
 Opt-in via env vars; if `REMOTE_TARGET_URL` is unset the original shared-engine
 path runs unchanged.
 
+## Which trainer? Use `random` (matches the paper)
+The remote-target support is ported to **both** strategy trainers:
+- **`dapo_ray_trainer_random_strat.py`** (`strategy_type=random`) — **the published
+  method** (paper §4.4; the only strategy trainer in the release). **Use this** for
+  results that must be consistent with the paper. Launcher: `run_userprompt_remote_random.sh`.
+- `dapo_ray_trainer_strat_ingroup.py` (`strategy_type=ingroup`) — a newer, unpublished
+  contrastive in-group variant (not in the paper). Launcher: `run_userprompt_remote.sh`.
+
 ## Files added
 - `remote_target_client.py` — HTTP client: builds messages+tools, concurrent
   POST, re-serialises the target's tool call into `<tool_call>{json}</tool_call>`
   so the existing reward manager parses it unchanged.
-- `dapo_ray_trainer_strat_ingroup.py` — ingroup trainer with `_get_remote_target_cfg()`
-  + `_remote_target()`; all `build_target_batch`/`target_generate_sequences` call
-  sites guarded so remote is used only when `REMOTE_TARGET_URL` is set. Also
-  supports padding each target's tool list to `REMOTE_TARGET_MIN_TOOLS` distractor
-  tools (reviewer: many-tools setting).
-- `main_dapo.py` — now supports `trainer.strategy_type=ingroup`.
+- `dapo_ray_trainer_random_strat.py` / `dapo_ray_trainer_strat_ingroup.py` — both
+  gain `_get_remote_target_cfg()` + `_remote_target()`; all
+  `build_target_batch`/`target_generate_sequences` call sites guarded so remote is
+  used only when `REMOTE_TARGET_URL` is set. Also supports padding each target's tool
+  list to `REMOTE_TARGET_MIN_TOOLS` distractor tools (reviewer: many-tools setting).
+- `main_dapo.py` — supports `trainer.strategy_type=ingroup` (in addition to `random`).
 - `serve_target.sh` — launches the target vLLM server.
+- `run_userprompt_remote_random.sh` — training launcher (**random** + remote target, recommended).
 - `run_userprompt_remote.sh` — training launcher (ingroup + remote target).
 
 ## Requirements — TWO SEPARATE conda envs
