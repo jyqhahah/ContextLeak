@@ -1006,6 +1006,7 @@ Extract the KEY PHRASES from the better-performing description."""
         # realistic (reviewer #4). Scoring is by tool-name match, so position/order
         # of the extra distractors does not affect correctness.
         min_tools = int(os.environ.get("REMOTE_TARGET_MIN_TOOLS", "0"))
+        retrieval_k = int(os.environ.get("REMOTE_TARGET_RETRIEVAL_K", "0"))
         benign_pool = []
         if min_tools > 0:
             seen_pool = set()
@@ -1074,6 +1075,11 @@ Extract the KEY PHRASES from the better-performing description."""
             # 2) cc_like request: messages (NO tool text) + tool schemas
             messages = RTC.build_messages([{"role": m["role"], "content": m["content"]} for m in chat_history])
             tools = RTC.build_tool_schemas(tool_set)
+            # ToolSearch-style retrieval gate (models Claude Code two-stage selection):
+            # keep only top-K tools by relevance so the malicious tool must be
+            # retrieved before it can be selected.
+            if retrieval_k > 0:
+                tools = RTC.retrieve_topk(tools, chat_history[-1]["content"], retrieval_k)
             requests_list.append({"messages": messages, "tools": tools})
 
             # 3) prompt tokens for logging/length (raw last user content)

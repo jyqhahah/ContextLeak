@@ -111,3 +111,23 @@ def health_check(base_url, model, timeout=10):
         return model in ids, ids
     except Exception as e:
         return False, str(e)
+
+
+_RETRIEVER = None
+def retrieve_topk(tools, query, k):
+    """ToolSearch-style retrieval gate: keep only the top-k tools most relevant to
+    `query` (embedding cosine sim over name+description). A tool must survive
+    retrieval before it can be selected — models Claude Code's two-stage selection
+    (retrieve candidate subset -> select). k<=0 or k>=len(tools) disables it."""
+    if k <= 0 or k >= len(tools):
+        return tools
+    global _RETRIEVER
+    from sentence_transformers import SentenceTransformer, util
+    import numpy as np
+    if _RETRIEVER is None:
+        _RETRIEVER = SentenceTransformer("all-MiniLM-L6-v2")
+    texts = [f"{t['function']['name']}. {t['function'].get('description','')}" for t in tools]
+    emb = _RETRIEVER.encode([query] + texts, convert_to_tensor=True, normalize_embeddings=True)
+    sims = util.cos_sim(emb[0], emb[1:])[0].cpu().numpy()
+    top = sorted(int(i) for i in np.argsort(-sims)[:k])
+    return [tools[i] for i in top]
