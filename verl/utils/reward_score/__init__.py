@@ -25,6 +25,7 @@ def default_compute_score(
     concurrent_semaphore=None,
     memory_limit_mb=None,
     attack_target="memory",
+    lambda_val=0.5,
     **kwargs,
 ):
     """Compute the score for a given solution based on the data source.
@@ -106,7 +107,9 @@ def default_compute_score(
 
     elif data_source in ["tool_selection"]:
         from . import toolattack
-        res = toolattack.compute_score(solution_str, ground_truth, attack_target=attack_target)
+        res = toolattack.compute_score(
+            solution_str, ground_truth, attack_target=attack_target, lambda_val=lambda_val
+        )
 
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")

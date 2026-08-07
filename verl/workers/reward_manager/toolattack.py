@@ -78,6 +78,7 @@ class ToolAttackRewardManager(AbstractRewardManager):
         overlong_buffer_cfg=None,
         warmup_steps=30,
         memory_scale=1.0,
+        lambda_val=0.5,
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine
@@ -87,6 +88,8 @@ class ToolAttackRewardManager(AbstractRewardManager):
         self.reward_fn_key = reward_fn_key
         self.warmup_steps = warmup_steps
         self.memory_scale = memory_scale
+        self.lambda_val = lambda_val
+        print(f"[ToolAttackRewardManager] lambda_val={self.lambda_val}")
 
 
     def __call__(self, data: DataProto, return_dict: bool = False):
@@ -190,6 +193,7 @@ class ToolAttackRewardManager(AbstractRewardManager):
                     ground_truth=ground_truth,
                     extra_info=extra_info,
                     attack_target=attack_target,
+                    lambda_val=self.lambda_val,
                 )
 
                 raw_score = score["score"] if isinstance(score, dict) else score
