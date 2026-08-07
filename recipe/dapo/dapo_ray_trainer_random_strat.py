@@ -1016,9 +1016,16 @@ Rules:
               + ", ".join(f"{k}={len(v)}" for k, v in sorted(by_cat.items())))
 
         # Persisted sample -> distractor-name assignment, so reruns are identical.
-        self._assign_path = os.environ.get(
-            "TOOL_ASSIGNMENT_FILE",
-            os.path.join(self.config.trainer.default_local_dir, "tool_assignment.json"),
+        # Prefer the version checked into the repo: a fresh clone then reproduces the
+        # exact tool lists the reported numbers were produced with, instead of
+        # regenerating them into a checkpoint dir nobody ships.
+        repo_default = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "data", "Ours_toolbench", "tool_assignment.json",
+        )
+        self._assign_path = os.environ.get("TOOL_ASSIGNMENT_FILE") or (
+            repo_default if os.path.exists(repo_default)
+            else os.path.join(self.config.trainer.default_local_dir, "tool_assignment.json")
         )
         if os.path.exists(self._assign_path):
             with open(self._assign_path) as fh:
@@ -1043,7 +1050,10 @@ Rules:
         """
         if n_total <= 0:
             return []
-        key = str(sample_key)
+        # The key must carry the sizes, not just the sample id: the many-tools study
+        # runs the same samples at 10/20/40/80, and a uuid-only key would hand a run
+        # at 40 the 20-tool list saved by the previous run.
+        key = f"{sample_key}|n{n_total}|s{n_same_cat}"
         if key not in self._assign:
             rng = random.Random(
                 int(hashlib.sha256(key.encode()).hexdigest()[:16], 16)
