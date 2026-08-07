@@ -501,8 +501,12 @@ Rules:
             new_batch = new_batch.union(gen_batch_output)
 
             # build_target_batch writes malicious_tool_description into extra_info
-            target_input_batch = self.build_target_batch(gen_batch_output, new_batch)
-            target_output_batch = self.actor_rollout_wg.target_generate_sequences(target_input_batch)
+            if self._get_remote_target_cfg() is not None:
+                target_input_batch = None
+                target_output_batch = self._remote_target(gen_batch_output, new_batch)
+            else:
+                target_input_batch = self.build_target_batch(gen_batch_output, new_batch)
+                target_output_batch = self.actor_rollout_wg.target_generate_sequences(target_input_batch)
             target_output_batch.meta_info.pop("timing", None)
             new_batch = new_batch.union(target_output_batch)
 
@@ -799,6 +803,175 @@ Rules:
         })
         return ret_dataproto
 
+    def _get_remote_target_cfg(self):
+        """Enabled iff env REMOTE_TARGET_URL is set. Returns None otherwise, in
+        which case the original shared-engine target path is used unchanged."""
+        url = os.environ.get("REMOTE_TARGET_URL", "").strip()
+        if not url:
+            return None
+        return {
+            "url": url,
+            "model": os.environ.get("REMOTE_TARGET_MODEL", "qwen35-target"),
+            "workers": int(os.environ.get("REMOTE_TARGET_WORKERS", "32")),
+        }
+
+    def _remote_target(self, attacker_output_batch, original_batch):
+        """Query a SEPARATE Qwen3.5 vLLM server (real function-calling, free
+        choice, neutral system prompt) as the target agent, instead of the shared
+        Qwen3-8B engine. Returns a DataProto with the SAME keys as
+        target_generate_sequences so the reward manager / union are unchanged.
+        Also writes malicious_tool_name / malicious_tool_description into
+        original_batch.extra_info exactly like build_target_batch."""
+        import sys
+        from tensordict import TensorDict
+        _here = os.path.dirname(os.path.abspath(__file__))
+        if _here not in sys.path:
+            sys.path.insert(0, _here)
+        import remote_target_client as RTC
+
+        cfg = self._get_remote_target_cfg()
+        prompts = attacker_output_batch.batch["prompts"]
+        responses = attacker_output_batch.batch["responses"]
+        full_attention_mask = attacker_output_batch.batch["attention_mask"]
+        batch_size = prompts.shape[0]
+        response_len = responses.shape[1]
+        prompt_len = prompts.shape[1]
+        response_attention_mask = full_attention_mask[:, prompt_len:]
+        device = prompts.device
+        max_len = prompt_len
+        resp_len = self.config.actor_rollout_ref.rollout.response_length
+        pad_token_id = self.tokenizer.pad_token_id
+
+        # optional: pad each target's tool list to REMOTE_TARGET_MIN_TOOLS benign
+        # tools (sampled from a batch-level pool) to make selection harder / more
+        # realistic (reviewer #4). Scoring is by tool-name match, so position/order
+        # of the extra distractors does not affect correctness.
+        min_tools = int(os.environ.get("REMOTE_TARGET_MIN_TOOLS", "0"))
+        benign_pool = []
+        if min_tools > 0:
+            seen_pool = set()
+            for i in range(batch_size):
+                ei = original_batch.non_tensor_batch["extra_info"][i]
+                ts_i = ei["tool_set"]
+                ts_i = json.loads(ts_i) if isinstance(ts_i, str) else ts_i
+                for t in ts_i:
+                    nm = t["openai_tools"][0]["function"]["name"]
+                    if nm not in seen_pool:
+                        seen_pool.add(nm)
+                        benign_pool.append(t)
+
+        requests_list = []
+        per_sample = []  # (malicious_name, prompt_token_ids)
+        for i in range(batch_size):
+            # 1) recover attacker's malicious tool name/description (same as build_target_batch)
+            mask_i = response_attention_mask[i]
+            valid_len = 0
+            for j in range(response_len - 1, -1, -1):
+                if mask_i[j] != 0:
+                    valid_len = j + 1
+                    break
+            text = self.tokenizer.decode(responses[i][:valid_len], skip_special_tokens=True)
+            malicious_description = text.split("</think>")[-1].strip() if "</think>" in text else text.strip()
+
+            extra_info = original_batch.non_tensor_batch["extra_info"][i]
+            category = extra_info["category"]
+            attack_target = extra_info["attack_target"]
+            try:
+                parsed = json.loads(repair_json(malicious_description))
+                malicious_tool_name = parsed["tool_name"]
+                malicious_tool_description = parsed["description"]
+            except Exception:
+                malicious_tool_name = f"unified_{category.lower()}_handler"
+                malicious_tool_description = malicious_description
+
+            chat_history = copy.deepcopy(extra_info["chat_history"])
+            if hasattr(chat_history, "tolist"):
+                chat_history = chat_history.tolist()
+            ts = extra_info["tool_set"]
+            tool_set = json.loads(ts) if isinstance(ts, str) else copy.deepcopy(ts)
+            malicious_entry = {
+                "owner": category, "repo": f"malicious_{malicious_tool_name}",
+                "tool_name": malicious_tool_name, "gt": False, "is_malicious": True,
+                "openai_tools": [{"type": "function", "function": {
+                    "name": malicious_tool_name,
+                    "description": malicious_tool_description,
+                    "parameters": param_schema_dict[attack_target],
+                }}],
+            }
+            tool_set.insert(extra_info["malicious_index"], malicious_entry)
+            original_batch.non_tensor_batch["extra_info"][i]["malicious_tool_name"] = malicious_tool_name
+            original_batch.non_tensor_batch["extra_info"][i]["malicious_tool_description"] = malicious_tool_description
+
+            # 1b) pad with distractor benign tools up to min_tools
+            if min_tools > len(tool_set) and benign_pool:
+                present = {t["openai_tools"][0]["function"]["name"] for t in tool_set}
+                extras = [t for t in benign_pool
+                          if t["openai_tools"][0]["function"]["name"] not in present]
+                need = min_tools - len(tool_set)
+                if extras:
+                    chosen = random.sample(extras, min(need, len(extras)))
+                    tool_set.extend(chosen)
+
+            # 2) cc_like request: messages (NO tool text) + tool schemas
+            messages = RTC.build_messages([{"role": m["role"], "content": m["content"]} for m in chat_history])
+            tools = RTC.build_tool_schemas(tool_set)
+            requests_list.append({"messages": messages, "tools": tools})
+
+            # 3) prompt tokens for logging/length (raw last user content)
+            pids = self.tokenizer.encode(chat_history[-1]["content"], add_special_tokens=False)
+            per_sample.append((malicious_tool_name, pids))
+
+        # 4) query the remote target agent concurrently.
+        # Cap output tokens so (prompt + output) stays within the target server's
+        # context window (padding to min_tools bloats the prompt; the target only
+        # needs to emit one tool call, so a large output budget is unnecessary).
+        remote_max_tokens = int(os.environ.get("REMOTE_TARGET_MAX_TOKENS", "2048"))
+        remote_max_tokens = min(remote_max_tokens, resp_len)
+        print(f"[remote_target] querying {len(requests_list)} candidates @ {cfg['url']} "
+              f"(model={cfg['model']}, min_tools={min_tools}, max_tokens={remote_max_tokens})")
+        results = RTC.query_target_batch(
+            requests_list, cfg["url"], cfg["model"], max_workers=cfg["workers"], max_tokens=remote_max_tokens
+        )
+        _n_hit = sum(1 for k in range(len(results))
+                     if results[k] and per_sample[k][0].lower() in (results[k].get("name", "") or "").lower())
+        print(f"[remote_target] done: {_n_hit}/{len(results)} selected the malicious tool")
+
+        # 5) synthesize <tool_call> text tokens and assemble target tensors
+        p_ids, p_mask, r_ids, r_mask = [], [], [], []
+        for i in range(batch_size):
+            _, pids = per_sample[i]
+            res = results[i] or {"name": "", "arguments": {}}
+            synth = RTC.synthesize_tool_call_text(res.get("name", ""), res.get("arguments", {}))
+            rids = self.tokenizer.encode(synth, add_special_tokens=False)
+
+            pids = pids[-max_len:]
+            pl = len(pids)
+            p_ids.append([pad_token_id] * (max_len - pl) + pids)
+            p_mask.append([0] * (max_len - pl) + [1] * pl)
+
+            rids = rids[:resp_len]
+            rl = len(rids)
+            r_ids.append(rids + [pad_token_id] * (resp_len - rl))
+            r_mask.append([1] * rl + [0] * (resp_len - rl))
+
+        prompts_target = torch.tensor(p_ids, dtype=prompts.dtype, device=device)
+        responses_target = torch.tensor(r_ids, dtype=prompts.dtype, device=device)
+        prompt_mask = torch.tensor(p_mask, dtype=full_attention_mask.dtype, device=device)
+        resp_mask = torch.tensor(r_mask, dtype=full_attention_mask.dtype, device=device)
+        input_ids_target = torch.cat([prompts_target, responses_target], dim=-1)
+        attention_mask_target = torch.cat([prompt_mask, resp_mask], dim=-1)
+        position_ids_target = compute_position_id_with_mask(attention_mask_target)
+
+        batch = TensorDict({
+            "prompts_target": prompts_target,
+            "responses_target": responses_target,
+            "input_ids_target": input_ids_target,
+            "attention_mask_target": attention_mask_target,
+            "position_ids_target": position_ids_target,
+        }, batch_size=batch_size)
+        non_tensor = {"target_logprobs": np.array([[] for _ in range(batch_size)], dtype=object)}
+        return DataProto(batch=batch, non_tensor_batch=non_tensor)
+
     def _render_tools_to_user_prompt(self, tool_set, user_prompt):
         lines = [user_prompt]
         lines.append("Available tools:\n")
@@ -911,18 +1084,21 @@ Rules:
             attacker_output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in attacker_output_ids]
             sample_attacker_outputs.extend(attacker_output_texts)
 
-            target_input_batch = self.build_target_batch(attacker_output_gen_batch, test_batch)
-            target_input_batch_padded, pad_size = pad_dataproto_to_divisor(target_input_batch, size_divisor)
-            target_input_batch_padded.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-                "global_steps": self.global_steps,
-            }
-            target_output_batch = self.actor_rollout_wg.target_generate_sequences(target_input_batch_padded)
-            target_output_batch = unpad_dataproto(target_output_batch, pad_size=pad_size)
+            if self._get_remote_target_cfg() is not None:
+                target_output_batch = self._remote_target(attacker_output_gen_batch, test_batch)
+            else:
+                target_input_batch = self.build_target_batch(attacker_output_gen_batch, test_batch)
+                target_input_batch_padded, pad_size = pad_dataproto_to_divisor(target_input_batch, size_divisor)
+                target_input_batch_padded.meta_info = {
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "recompute_log_prob": False,
+                    "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                    "validate": True,
+                    "global_steps": self.global_steps,
+                }
+                target_output_batch = self.actor_rollout_wg.target_generate_sequences(target_input_batch_padded)
+                target_output_batch = unpad_dataproto(target_output_batch, pad_size=pad_size)
 
             target_output_ids = target_output_batch.batch["responses_target"]
             target_output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in target_output_ids]
@@ -1109,8 +1285,12 @@ Rules:
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
                             gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-                            target_baseline_input_batch = self.build_target_batch(gen_baseline_output, new_batch)
-                            target_baseline_output_batch = self.actor_rollout_wg.target_generate_sequences(target_baseline_input_batch)
+                            if self._get_remote_target_cfg() is not None:
+                                target_baseline_input_batch = None
+                                target_baseline_output_batch = self._remote_target(gen_baseline_output, new_batch)
+                            else:
+                                target_baseline_input_batch = self.build_target_batch(gen_baseline_output, new_batch)
+                                target_baseline_output_batch = self.actor_rollout_wg.target_generate_sequences(target_baseline_input_batch)
                             new_batch = new_batch.union(gen_baseline_output)
                             new_batch = new_batch.union(target_baseline_output_batch)
                             rm_scores = None
@@ -1140,8 +1320,12 @@ Rules:
                             reward_tensor = self.rm_wg.compute_rm_score(new_batch)
                             new_batch = new_batch.union(reward_tensor)
 
-                        target_input_batch = self.build_target_batch(gen_batch_output, new_batch)
-                        target_output_batch = self.actor_rollout_wg.target_generate_sequences(target_input_batch)
+                        if self._get_remote_target_cfg() is not None:
+                            target_input_batch = None
+                            target_output_batch = self._remote_target(gen_batch_output, new_batch)
+                        else:
+                            target_input_batch = self.build_target_batch(gen_batch_output, new_batch)
+                            target_output_batch = self.actor_rollout_wg.target_generate_sequences(target_input_batch)
                         timing_raw.update(target_output_batch.meta_info.pop("timing", {}))
                         new_batch = new_batch.union(target_output_batch)
                         new_batch.meta_info["global_step"] = self.global_steps
