@@ -913,6 +913,16 @@ Rules:
                     chosen = random.sample(extras, min(need, len(extras)))
                     tool_set.extend(chosen)
 
+            # 1c) cap pathological descriptions (see _truncate_tool_description).
+            # The padding above draws from benign_pool, which is exactly where the
+            # multi-thousand-token ToolBench docs get pulled in; at min_tools=40/80
+            # a single one of them overruns the target's context on its own.
+            for t in tool_set:
+                _fn = t["openai_tools"][0]["function"]
+                _fn["description"] = self._truncate_tool_description(
+                    _fn.get("name", "?"), _fn.get("description", "")
+                )
+
             # 2) cc_like request: messages (NO tool text) + tool schemas
             messages = RTC.build_messages([{"role": m["role"], "content": m["content"]} for m in chat_history])
             tools = RTC.build_tool_schemas(tool_set)
@@ -978,6 +988,32 @@ Rules:
         non_tensor = {"target_logprobs": np.array([[] for _ in range(batch_size)], dtype=object)}
         return DataProto(batch=batch, non_tensor_batch=non_tensor)
 
+    def _truncate_tool_description(self, name: str, desc: str) -> str:
+        """Cap a single tool description at TOOL_DESC_MAX_TOKENS tokens.
+
+        A handful of ToolBench tools carry a whole API documentation page in
+        `description` instead of a one-line summary -- `fitness` is 6737 tokens
+        against a 56-token median (p99 = 429). One such tool inflates the target
+        prompt ~28x, and with 40-80 benign tools it blows past max_prompt_length
+        outright. Truncating only affects the ~0.25% of tools that are already
+        malformed, and none of them is ever the ground-truth tool.
+        """
+        max_tok = int(os.environ.get("TOOL_DESC_MAX_TOKENS", "512"))
+        if max_tok <= 0:
+            return desc
+        # Cheap guard: ~4 chars/token, so anything short cannot exceed the cap.
+        if len(desc) <= max_tok * 3:
+            return desc
+        ids = self.tokenizer(desc, add_special_tokens=False).input_ids
+        if len(ids) <= max_tok:
+            return desc
+        truncated = self.tokenizer.decode(ids[:max_tok], skip_special_tokens=True)
+        n = getattr(self, "_tool_trunc_count", 0)
+        if n < 5:
+            print(f"[tool-trunc] '{name}': {len(ids)} -> {max_tok} tokens")
+        self._tool_trunc_count = n + 1
+        return truncated.rstrip() + " ...[truncated]"
+
     def _render_tools_to_user_prompt(self, tool_set, user_prompt):
         lines = [user_prompt]
         lines.append("Available tools:\n")
@@ -986,7 +1022,7 @@ Rules:
             fn = tool["openai_tools"][0]["function"]
             lines.append(f"{i}. {fn['name']}")
             lines.append("Description:")
-            lines.append(fn["description"].strip())
+            lines.append(self._truncate_tool_description(fn["name"], fn["description"].strip()))
 
             params = fn["parameters"]
             props = params.get("properties", {})
