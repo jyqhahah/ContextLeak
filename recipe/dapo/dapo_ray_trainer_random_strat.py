@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import hashlib
 import uuid
 import random
 import heapq
@@ -848,18 +849,9 @@ Rules:
         # of the extra distractors does not affect correctness.
         min_tools = int(os.environ.get("REMOTE_TARGET_MIN_TOOLS", "0"))
         retrieval_k = int(os.environ.get("REMOTE_TARGET_RETRIEVAL_K", "0"))
-        benign_pool = []
+        same_cat_tools = int(os.environ.get("REMOTE_TARGET_SAME_CAT", "7"))
         if min_tools > 0:
-            seen_pool = set()
-            for i in range(batch_size):
-                ei = original_batch.non_tensor_batch["extra_info"][i]
-                ts_i = ei["tool_set"]
-                ts_i = json.loads(ts_i) if isinstance(ts_i, str) else ts_i
-                for t in ts_i:
-                    nm = t["openai_tools"][0]["function"]["name"]
-                    if nm not in seen_pool:
-                        seen_pool.add(nm)
-                        benign_pool.append(t)
+            self._build_tool_pool()
 
         requests_list = []
         per_sample = []  # (malicious_name, prompt_token_ids)
@@ -903,15 +895,18 @@ Rules:
             original_batch.non_tensor_batch["extra_info"][i]["malicious_tool_name"] = malicious_tool_name
             original_batch.non_tensor_batch["extra_info"][i]["malicious_tool_description"] = malicious_tool_description
 
-            # 1b) pad with distractor benign tools up to min_tools
-            if min_tools > len(tool_set) and benign_pool:
-                present = {t["openai_tools"][0]["function"]["name"] for t in tool_set}
-                extras = [t for t in benign_pool
-                          if t["openai_tools"][0]["function"]["name"] not in present]
-                need = min_tools - len(tool_set)
-                if extras:
-                    chosen = random.sample(extras, min(need, len(extras)))
-                    tool_set.extend(chosen)
+            # 1b) pad with distractor benign tools up to min_tools, split across
+            # categories and FIXED per sample (see _padding_tools_for).
+            if min_tools > len(tool_set):
+                tool_set.extend(
+                    self._padding_tools_for(
+                        sample_key=extra_info.get("index"),
+                        category=extra_info.get("category"),
+                        present={t["openai_tools"][0]["function"]["name"] for t in tool_set},
+                        n_total=min_tools - len(tool_set),
+                        n_same_cat=max(0, same_cat_tools - len(tool_set)),
+                    )
+                )
 
             # 1c) cap pathological descriptions (see _truncate_tool_description).
             # The padding above draws from benign_pool, which is exactly where the
@@ -936,6 +931,9 @@ Rules:
             # 3) prompt tokens for logging/length (raw last user content)
             pids = self.tokenizer.encode(chat_history[-1]["content"], add_special_tokens=False)
             per_sample.append((malicious_tool_name, pids))
+
+        if min_tools > 0:
+            self._save_tool_assignment()
 
         # 4) query the remote target agent concurrently.
         # Cap output tokens so (prompt + output) stays within the target server's
@@ -987,6 +985,88 @@ Rules:
         }, batch_size=batch_size)
         non_tensor = {"target_logprobs": np.array([[] for _ in range(batch_size)], dtype=object)}
         return DataProto(batch=batch, non_tensor_batch=non_tensor)
+
+    def _build_tool_pool(self):
+        """Global tool pool grouped by category (`owner`), built once from the data files.
+
+        The previous pool was assembled from whatever happened to be in the current
+        batch, so a sample's distractors changed with batch composition and with every
+        `random.sample` draw -- two runs of the same config saw different tool lists.
+        Reading the parquet directly makes the pool independent of batching.
+        """
+        if getattr(self, "_tool_pool", None) is not None:
+            return
+        import pandas as pd
+        from collections import defaultdict
+
+        by_cat, seen = defaultdict(list), set()
+        files = [self.config.data.train_files, self.config.data.val_files]
+        files = [f for grp in files for f in (grp if isinstance(grp, (list, tuple)) else [grp])]
+        for f in files:
+            for ei in pd.read_parquet(f)["extra_info"]:
+                ts = ei["tool_set"]
+                for t in (json.loads(ts) if isinstance(ts, str) else ts):
+                    nm = t["openai_tools"][0]["function"]["name"]
+                    if nm in seen:
+                        continue
+                    seen.add(nm)
+                    by_cat[t.get("owner")].append(t)
+        self._tool_pool = dict(by_cat)
+        print(f"[tool-pool] {len(seen)} unique tools across {len(by_cat)} categories: "
+              + ", ".join(f"{k}={len(v)}" for k, v in sorted(by_cat.items())))
+
+        # Persisted sample -> distractor-name assignment, so reruns are identical.
+        self._assign_path = os.environ.get(
+            "TOOL_ASSIGNMENT_FILE",
+            os.path.join(self.config.trainer.default_local_dir, "tool_assignment.json"),
+        )
+        if os.path.exists(self._assign_path):
+            with open(self._assign_path) as fh:
+                self._assign = json.load(fh)
+            print(f"[tool-pool] loaded {len(self._assign)} fixed assignments from {self._assign_path}")
+        else:
+            self._assign = {}
+        self._assign_dirty = False
+        self._by_name = {t["openai_tools"][0]["function"]["name"]: t
+                         for lst in by_cat.values() for t in lst}
+
+    def _padding_tools_for(self, sample_key, category, present, n_total, n_same_cat):
+        """Distractors for one sample: n_same_cat from its own category, rest from others.
+
+        Mixing categories matters because a single-category tool list makes the
+        retrieval gate trivial -- every candidate is topically close to the query, so
+        top-K selects on noise. With most distractors off-category, surviving retrieval
+        actually requires the attacker's description to be relevant.
+
+        The draw is seeded from the sample's own uuid (hashlib, not hash(), which is
+        salted per process) and cached to disk, so every run sees the same tool list.
+        """
+        if n_total <= 0:
+            return []
+        key = str(sample_key)
+        if key not in self._assign:
+            rng = random.Random(
+                int(hashlib.sha256(key.encode()).hexdigest()[:16], 16)
+            )
+            same = [t for t in self._tool_pool.get(category, [])
+                    if t["openai_tools"][0]["function"]["name"] not in present]
+            other = [t for cat, lst in self._tool_pool.items() if cat != category
+                     for t in lst if t["openai_tools"][0]["function"]["name"] not in present]
+            n_same = min(n_same_cat, n_total, len(same))
+            picked = rng.sample(same, n_same)
+            n_other = min(n_total - n_same, len(other))
+            picked += rng.sample(other, n_other)
+            self._assign[key] = [t["openai_tools"][0]["function"]["name"] for t in picked]
+            self._assign_dirty = True
+        return [self._by_name[n] for n in self._assign[key] if n in self._by_name]
+
+    def _save_tool_assignment(self):
+        if getattr(self, "_assign_dirty", False):
+            os.makedirs(os.path.dirname(self._assign_path), exist_ok=True)
+            with open(self._assign_path, "w") as fh:
+                json.dump(self._assign, fh)
+            self._assign_dirty = False
+            print(f"[tool-pool] saved {len(self._assign)} assignments -> {self._assign_path}")
 
     def _truncate_tool_description(self, name: str, desc: str) -> str:
         """Cap a single tool description at TOOL_DESC_MAX_TOKENS tokens.

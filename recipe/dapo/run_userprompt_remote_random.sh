@@ -1,6 +1,27 @@
 #!/bin/bash
-project_name='ContextLeak'
-exp_name='DAPO-Qwen3-8B-UserPrompt-RemoteTarget-Random'
+project_name=${PROJECT_NAME:-'ContextLeak'}
+exp_name=${EXP_NAME:-'DAPO-Qwen3-8B-UserPrompt-RemoteTarget-Random'}
+
+# compute_score -> word_tokenize needs nltk punkt/punkt_tab. Without it word_tokenize
+# raises, reward_score/toolattack.py's bare `except` swallows it, and EVERY memory
+# reward silently returns 0.0 -- training looks alive but learns from a constant.
+export NLTK_DATA=${NLTK_DATA:-"/mnt/bn/algo-masp-nas-arnold2/yuqijia/model/.nltk_data"}
+python3 -c "
+import os, nltk
+nltk.data.path.insert(0, os.environ['NLTK_DATA'])
+nltk.data.find('tokenizers/punkt_tab/english/')
+" || { echo "[run] FATAL: nltk punkt_tab missing in ${NLTK_DATA}"; exit 1; }
+
+# wandb: ~/.netrc is rewritten periodically by a corp credential daemon, which drops
+# the api.wandb.ai entry and kills any run started afterwards. Read from a stable file.
+WANDB_KEY_FILE=${WANDB_KEY_FILE:-"/mnt/bn/algo-masp-nas-arnold2/yuqijia/envs/.wandb_key"}
+if [ -z "${WANDB_API_KEY:-}" ] && [ -r "${WANDB_KEY_FILE}" ]; then
+    WANDB_API_KEY="$(tr -d '[:space:]' < "${WANDB_KEY_FILE}")"
+    export WANDB_API_KEY
+fi
+if [ -z "${WANDB_API_KEY:-}" ]; then
+    echo "[run] FATAL: no WANDB_API_KEY (put it in ${WANDB_KEY_FILE})"; exit 1
+fi
 
 adv_estimator=grpo
 
