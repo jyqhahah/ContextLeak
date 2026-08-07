@@ -20,6 +20,7 @@ reward manager or the vLLM rollout worker needs to change.
 Only depends on `requests` (present in the training env).
 """
 import json
+import os
 import concurrent.futures as cf
 import requests
 
@@ -125,7 +126,14 @@ def retrieve_topk(tools, query, k):
     from sentence_transformers import SentenceTransformer, util
     import numpy as np
     if _RETRIEVER is None:
-        _RETRIEVER = SentenceTransformer("all-MiniLM-L6-v2")
+        # Keep the retriever on CPU: the trainer's GPU is already claimed by vLLM's
+        # preallocated pool (gpu_memory_utilization), so allocating there afterwards
+        # risks an OOM for no gain -- MiniLM is 22M params and encoding one batch of
+        # tools costs ~14s/step on CPU against a ~975s step (~1.4%).
+        # RETRIEVER_MODEL may point at a local snapshot so this never hits the network.
+        _model = os.environ.get("RETRIEVER_MODEL", "all-MiniLM-L6-v2")
+        _RETRIEVER = SentenceTransformer(_model, device=os.environ.get("RETRIEVER_DEVICE", "cpu"))
+        print(f"[retrieve_topk] retriever={_model} device={_RETRIEVER.device}")
     texts = [f"{t['function']['name']}. {t['function'].get('description','')}" for t in tools]
     emb = _RETRIEVER.encode([query] + texts, convert_to_tensor=True, normalize_embeddings=True)
     sims = util.cos_sim(emb[0], emb[1:])[0].cpu().numpy()
