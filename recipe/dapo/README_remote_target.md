@@ -83,6 +83,11 @@ bash recipe/dapo/run_userprompt_remote.sh
 - `REMOTE_TARGET_URL` — target server base URL (enables remote path). Unset = original shared-engine target.
 - `REMOTE_TARGET_MODEL` — served model name (default `qwen35-target`).
 - `REMOTE_TARGET_MIN_TOOLS` — pad each target's tool list to N distractor tools (default 10; 0 = off).
+- `REMOTE_TARGET_RETRIEVAL_K` — ToolSearch-style retrieval gate: expose only the top-K
+  tools by relevance to the task before selection (default 0 = off = all tools visible).
+  Models Claude Code's two-stage selection at scale (retrieve candidate subset → select);
+  the malicious tool must be retrieved before it can be selected. Use with a larger
+  `REMOTE_TARGET_MIN_TOOLS` (e.g. 40–80) to train/eval the many-tools setting.
 - `REMOTE_TARGET_WORKERS` — concurrent HTTP workers (default 32).
 - `REMOTE_TARGET_MAX_TOKENS` — cap target output tokens (default 2048; keeps prompt+output within ctx).
 - `TRAIN_GPU` — GPU index for training (put the target server on a different one).
